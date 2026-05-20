@@ -1,310 +1,331 @@
+# =============================================================================
 # app/auth/services.py
-# Pure business logic — no Flask request/response objects here.
-# Routes call these; tests can call them directly without an HTTP client.
+# Business logic for Auth0 token verification and user synchronisation.
 #
-# STRIDE responsibilities:
-#   Spoofing          — authenticate() rejects unverified / locked accounts
-#   Tampering         — register() validates and sanitises all inputs
-#   Repudiation       — AuditLog.record() called on every significant event
-#   Info Disclosure   — generic error messages; no account-existence leakage
-#   DoS               — account lockout after 5 failed attempts (15-min ban)
-#   Elevation         — role assigned server-side only; never from request body
+# What this file does:
+#   1. Verifies Auth0 JWT tokens (proves the request is genuinely from Auth0)
+#   2. Syncs the Auth0 user into our MySQL database on first login
+#   3. Updates the user row on subsequent logins (last_login_at, is_verified)
+#   4. Writes every event to AuditLog
+#
+# What this file does NOT do:
+#   - No custom login, register, or password logic — Auth0 owns all of that
+#   - No session management — Flask-Login handles sessions
+#   - No HTTP request/response objects — that belongs in routes.py
+#
+# Auth0 JWT verification flow:
+#   1. User logs in on the Next.js frontend via Auth0 Universal Login
+#   2. Auth0 returns a JWT access token to Next.js
+#   3. Next.js sends that token to Flask in: Authorization: Bearer <token>
+#   4. Flask calls Auth0TokenService.verify() to validate the token
+#   5. Auth0 publishes its public signing keys at a well-known URL (JWKS)
+#   6. We fetch those keys and use them to verify the token signature
+#   7. If valid, we trust the claims inside the token (sub, email, etc.)
+#
+# Dependencies:
+#   pip install python-jose[cryptography] requests
+# =============================================================================
 
-import re
+import logging
 from datetime import datetime, timezone
 
-from flask import request as flask_request
+import requests
+from flask import current_app, request as flask_request
+from jose import ExpiredSignatureError, JWTError, jwt
 
 from app.extensions import db
 from app.models import AuditLog, User
-from .email import (
-    send_account_confirmed_email,
-    send_login_alert_email,
-    send_verification_email,
-)
+
+logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Validation helpers
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Auth0TokenService
+# Handles all interaction with Auth0's token infrastructure.
+# =============================================================================
 
-_EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
-_USERNAME_RE = re.compile(r"^[a-zA-Z0-9_]{3,50}$")
-_MIN_PASSWORD_LEN = 8
-
-
-def _validate_registration(data: dict) -> list[str]:
+class Auth0TokenService:
     """
-    Return a list of validation error strings.
-    Empty list means the data is valid.
-    Never reveal whether an email already exists — that leaks account info.
-    """
-    errors = []
+    Verifies Auth0 JWT access tokens.
 
-    email = data.get("email", "").strip().lower()
-    username = data.get("username", "").strip()
-    password = data.get("password", "")
-    confirm = data.get("confirm_password", "")
+    STRIDE Spoofing:
+      We never trust a token's claims without cryptographic verification.
+      Auth0 signs every token with its private key.
+      We fetch Auth0's public keys (JWKS) and verify the signature.
+      A forged or tampered token will fail signature verification.
 
-    if not _EMAIL_RE.match(email):
-        errors.append("Invalid email address.")
-
-    if not _USERNAME_RE.match(username):
-        errors.append(
-            "Username must be 3–50 characters and contain only letters, numbers, or underscores."
-        )
-
-    if len(password) < _MIN_PASSWORD_LEN:
-        errors.append(f"Password must be at least {_MIN_PASSWORD_LEN} characters.")
-
-    if password != confirm:
-        errors.append("Passwords do not match.")
-
-    return errors
-
-
-# ---------------------------------------------------------------------------
-# Guest session helper
-# ---------------------------------------------------------------------------
-
-def create_guest_session() -> dict:
-    """
-    Called when an unregistered user hits the site.
-    Returns a lightweight session dict — no DB row is created for guests.
-    The guest token is stored in a signed Flask session cookie only.
-
-    STRIDE — Spoofing: guest session is server-signed; cannot be forged.
-    STRIDE — Elevation: guest role is set here, never upgradeable without login.
-    """
-    import secrets
-    return {
-        "guest_id": secrets.token_hex(16),  # anonymous session identifier
-        "role": "guest",
-        "cart": [],                          # in-session cart for unregistered users
-    }
-
-
-# ---------------------------------------------------------------------------
-# AuthService
-# ---------------------------------------------------------------------------
-
-class AuthService:
-    """
-    Stateless service class for all auth operations.
-    Each method follows the pattern: validate → act → audit → return.
+    STRIDE Info Disclosure:
+      We cache the JWKS response to avoid leaking request patterns and
+      to reduce latency. Cache is invalidated when a key ID is not found
+      (Auth0 rotates keys periodically).
     """
 
-    # ------------------------------------------------------------------
-    # Registration
-    # ------------------------------------------------------------------
+    # In-memory JWKS cache — key: Auth0 domain, value: JWKS dict
+    # Resets on server restart; populated lazily on first request.
+    _jwks_cache: dict = {}
 
-    @staticmethod
-    def register(data: dict) -> tuple[User | None, list[str]]:
+    @classmethod
+    def _get_jwks(cls, domain: str) -> dict:
         """
-        Register a new user.
+        Fetch Auth0's public signing keys (JWKS).
+        Cached in memory to avoid an HTTP request on every API call.
 
-        Returns (user, []) on success.
-        Returns (None, [error strings]) on failure.
-
-        Security notes:
-          - Role is hard-coded to 'customer'; never taken from request.
-          - Generic duplicate error prevents email enumeration.
-          - Verification token generated before DB commit so email is sent
-            with the correct token even if subsequent steps fail.
+        STRIDE DoS: if Auth0 is unreachable, returns None gracefully
+        rather than crashing the application.
         """
-        errors = _validate_registration(data)
-        if errors:
-            return None, errors
+        if domain in cls._jwks_cache:
+            return cls._jwks_cache[domain]
 
-        email = data["email"].strip().lower()
-        username = data["username"].strip()
-
-        # Check for duplicates — but return a generic error (no enumeration)
-        existing = User.query.filter(
-            (User.email == email) | (User.username == username)
-        ).first()
-        if existing:
-            return None, ["Registration failed. Please try different credentials."]
-
-        # Create user
-        user = User(email=email, username=username, role="customer")
-        user.set_password(data["password"])
-
-        # Generate email verification token (stored on user before commit)
-        verification_token = user.generate_verification_token()  # noqa: F841
-
-        db.session.add(user)
-
-        # Audit before commit so it's in the same transaction
-        AuditLog.record(
-            event="REGISTRATION",
-            user_id=user.id,
-            ip_address=_get_ip(),
-            user_agent=_get_ua(),
-        )
-
-        db.session.commit()
-
-        # Send welcome + verification email (after commit — user row exists)
+        jwks_url = f"https://{domain}/.well-known/jwks.json"
         try:
-            send_verification_email(user)
-        except Exception as exc:
-            # Email failure must not roll back registration.
-            # Log it but don't propagate.
-            current_app_log(f"[email] Failed to send verification email to {user.email}: {exc}")
+            response = requests.get(jwks_url, timeout=5)
+            response.raise_for_status()
+            jwks = response.json()
+            cls._jwks_cache[domain] = jwks
+            logger.info(f"[Auth0] Fetched and cached JWKS from {jwks_url}")
+            return jwks
+        except requests.RequestException as exc:
+            logger.error(f"[Auth0] Failed to fetch JWKS: {exc}")
+            return None
 
-        return user, []
+    @classmethod
+    def _invalidate_cache(cls, domain: str) -> None:
+        """
+        Remove cached JWKS for a domain.
+        Called when a token's key ID (kid) is not found in the cache,
+        which means Auth0 has rotated its signing keys.
+        """
+        cls._jwks_cache.pop(domain, None)
+        logger.info(f"[Auth0] JWKS cache invalidated for {domain}")
 
-    # ------------------------------------------------------------------
-    # Email verification
-    # ------------------------------------------------------------------
+    @classmethod
+    def verify(cls, token: str) -> dict | None:
+        """
+        Verify an Auth0 JWT access token.
+
+        Returns the decoded payload dict on success, None on any failure.
+        Never raises — all exceptions are caught and logged.
+
+        Payload contains:
+          sub       — Auth0 user ID  e.g. "auth0|64f3c2..."
+          email     — user's email (if profile scope was requested)
+          email_verified — bool
+          nickname  — username suggestion
+          iat       — issued at (Unix timestamp)
+          exp       — expiry (Unix timestamp)
+          aud       — audience (must match AUTH0_AUDIENCE in config)
+          iss       — issuer (must match https://{AUTH0_DOMAIN}/)
+
+        STRIDE Spoofing:
+          - Signature verified against Auth0's public keys
+          - Expiry (exp) checked — expired tokens rejected
+          - Audience (aud) checked — tokens for other apps rejected
+          - Issuer (iss) checked — tokens from other Auth0 tenants rejected
+        """
+        if not token:
+            return None
+
+        domain   = current_app.config.get("AUTH0_DOMAIN")
+        audience = current_app.config.get("AUTH0_AUDIENCE")
+
+        if not domain or not audience:
+            logger.error("[Auth0] AUTH0_DOMAIN or AUTH0_AUDIENCE not configured.")
+            return None
+
+        jwks = cls._get_jwks(domain)
+        if not jwks:
+            return None
+
+        try:
+            # Decode header only (no verification) to get the key ID (kid)
+            unverified_header = jwt.get_unverified_header(token)
+        except JWTError as exc:
+            logger.warning(f"[Auth0] Could not decode token header: {exc}")
+            return None
+
+        kid = unverified_header.get("kid")
+
+        # Find the matching public key in JWKS by kid
+        rsa_key = cls._find_rsa_key(jwks, kid)
+
+        if not rsa_key:
+            # Key not found — Auth0 may have rotated keys; invalidate cache and retry once
+            logger.info("[Auth0] kid not found in cache — refreshing JWKS.")
+            cls._invalidate_cache(domain)
+            jwks = cls._get_jwks(domain)
+            if jwks:
+                rsa_key = cls._find_rsa_key(jwks, kid)
+
+        if not rsa_key:
+            logger.warning("[Auth0] No matching RSA key found for token.")
+            return None
+
+        try:
+            payload = jwt.decode(
+                token,
+                rsa_key,
+                algorithms=["RS256"],       # Auth0 always uses RS256
+                audience=audience,
+                issuer=f"https://{domain}/",
+            )
+            return payload
+
+        except ExpiredSignatureError:
+            logger.warning("[Auth0] Token has expired.")
+            return None
+        except JWTError as exc:
+            logger.warning(f"[Auth0] Token verification failed: {exc}")
+            return None
 
     @staticmethod
-    def verify_email(token: str) -> tuple[User | None, str | None]:
+    def _find_rsa_key(jwks: dict, kid: str) -> dict | None:
         """
-        Verify a user's email address using the one-time token.
+        Extract the RSA public key matching the given key ID from JWKS.
+        Returns a dict in the format python-jose expects, or None.
+        """
+        for key in jwks.get("keys", []):
+            if key.get("kid") == kid:
+                return {
+                    "kty": key["kty"],
+                    "kid": key["kid"],
+                    "use": key["use"],
+                    "n":   key["n"],
+                    "e":   key["e"],
+                }
+        return None
+
+
+# =============================================================================
+# UserSyncService
+# Syncs an Auth0 user into the MySQL database.
+# =============================================================================
+
+class UserSyncService:
+    """
+    Creates or updates a User row from Auth0 token claims.
+
+    Called by routes.py after every successful token verification.
+    This is how Auth0 users enter our MySQL database.
+
+    STRIDE Tampering:
+      Role is never taken from the token or request body.
+      New users always get role='customer'.
+      Role changes require a separate admin endpoint.
+
+    STRIDE Repudiation:
+      Every sync event is written to AuditLog with IP and user agent.
+    """
+
+    @staticmethod
+    def sync(auth0_payload: dict) -> tuple["User | None", str | None]:
+        """
+        Find or create a User row from Auth0 token claims.
 
         Returns (user, None) on success.
         Returns (None, error_message) on failure.
+
+        auth0_payload keys used:
+          sub               — Auth0 unique user ID (required)
+          email             — user's email address (required)
+          email_verified    — bool (optional, defaults False)
+          nickname          — suggested username (optional)
         """
-        user = User.query.filter_by(verification_token=token).first()
+        auth0_id = auth0_payload.get("sub")
+        email    = auth0_payload.get("email")
 
-        if not user:
-            return None, "Invalid or expired verification link."
+        # sub and email are required — every Auth0 token has these
+        if not auth0_id or not email:
+            logger.warning("[UserSync] Token missing sub or email claim.")
+            return None, "Invalid token claims."
 
-        if not user.verify_email_token(token):
-            return None, "This verification link has expired. Please request a new one."
-
-        AuditLog.record(
-            event="EMAIL_VERIFIED",
-            user_id=user.id,
-            ip_address=_get_ip(),
-            user_agent=_get_ua(),
-        )
-
-        db.session.commit()
+        email = email.strip().lower()
 
         try:
-            send_account_confirmed_email(user)
-        except Exception as exc:
-            current_app_log(f"[email] Failed to send confirmation email: {exc}")
+            user = User.query.filter_by(auth0_id=auth0_id).first()
 
-        return user, None
-
-    # ------------------------------------------------------------------
-    # Login
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def authenticate(email: str, password: str) -> tuple[User | None, str | None, str | None]:
-        """
-        Authenticate a user by email + password.
-
-        Returns (user, jwt_token, None) on success.
-        Returns (None, None, error_message) on failure.
-
-        Security notes:
-          - Same generic error for wrong email AND wrong password (no enumeration).
-          - Account lockout enforced before password check.
-          - Failed attempts recorded even when user not found (to prevent
-            timing-based enumeration: always runs the same code path).
-        """
-        GENERIC_ERROR = "Invalid email or password."
-
-        user = User.query.filter_by(email=email.strip().lower()).first()
-
-        # --- Constant-time guard: always do a password check to prevent timing leaks
-        dummy_hash = b"$2b$12$invalidhashpadding000000000000000000000000000000000000"
-        check_target = user.password_hash if user else dummy_hash
-
-        from bcrypt import checkpw
-        password_ok = checkpw(password.encode("utf-8"), check_target)
-
-        if not user or not password_ok:
             if user:
-                user.record_failed_attempt()
+                # Existing user — update fields that may have changed in Auth0
+                user.is_verified  = auth0_payload.get("email_verified", False)
+                user.last_login_at = datetime.now(timezone.utc)
+
                 AuditLog.record(
-                    event="LOGIN_FAIL",
+                    event="LOGIN_AUTH0",
                     user_id=user.id,
                     ip_address=_get_ip(),
                     user_agent=_get_ua(),
+                    detail=f"auth0_id={auth0_id}",
                 )
-                db.session.commit()
-            return None, None, GENERIC_ERROR
+                logger.info(f"[UserSync] Existing user logged in: {email}")
 
-        if user.is_locked():
-            AuditLog.record(
-                event="LOGIN_BLOCKED_LOCKOUT",
-                user_id=user.id,
-                ip_address=_get_ip(),
-            )
+            else:
+                # New user — create a row in MySQL for the first time
+                username = _derive_username(auth0_payload, email)
+
+                user = User(
+                    auth0_id    = auth0_id,
+                    email       = email,
+                    username    = username,
+                    role        = "customer",   # STRIDE Elevation: always customer
+                    is_verified = auth0_payload.get("email_verified", False),
+                    is_active   = True,
+                )
+                db.session.add(user)
+                # Flush to get the user.id before AuditLog.record()
+                db.session.flush()
+
+                AuditLog.record(
+                    event="REGISTRATION_AUTH0",
+                    user_id=user.id,
+                    ip_address=_get_ip(),
+                    user_agent=_get_ua(),
+                    detail=f"auth0_id={auth0_id}",
+                )
+                logger.info(f"[UserSync] New user registered: {email}")
+
             db.session.commit()
-            return None, None, "Account temporarily locked. Please try again later."
+            return user, None
 
-        if not user.is_verified:
-            return None, None, "Please verify your email address before logging in."
-
-        if not user.is_active:
-            return None, None, "This account has been deactivated."
-
-        # Successful login
-        user.reset_failed_attempts()
-        user.last_login_at = datetime.now(timezone.utc)
-        token = user.generate_jwt()
-
-        AuditLog.record(
-            event="LOGIN_SUCCESS",
-            user_id=user.id,
-            ip_address=_get_ip(),
-            user_agent=_get_ua(),
-        )
-
-        db.session.commit()
-
-        # Security alert email (async in production; synchronous here for simplicity)
-        try:
-            send_login_alert_email(user, _get_ip())
         except Exception as exc:
-            current_app_log(f"[email] Failed to send login alert: {exc}")
-
-        return user, token, None
-
-    # ------------------------------------------------------------------
-    # Logout
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def logout(user_id: str) -> None:
-        """Record logout event. Flask-Login clears the session cookie."""
-        AuditLog.record(
-            event="LOGOUT",
-            user_id=user_id,
-            ip_address=_get_ip(),
-            user_agent=_get_ua(),
-        )
-        db.session.commit()
+            db.session.rollback()
+            logger.error(f"[UserSync] Database error during sync: {exc}")
+            return None, "Failed to sync user. Please try again."
 
 
-# ---------------------------------------------------------------------------
+# =============================================================================
 # Private helpers
-# ---------------------------------------------------------------------------
+# =============================================================================
 
 def _get_ip() -> str:
-    """Extract real IP, respecting X-Forwarded-For when behind a proxy."""
+    """
+    Extract the real client IP from the request.
+    Respects X-Forwarded-For when Flask is behind a reverse proxy (Nginx).
+
+    STRIDE Info Disclosure: IP is stored in AuditLog for security purposes
+    only — never returned in public API responses.
+    """
     forwarded = flask_request.headers.get("X-Forwarded-For")
     if forwarded:
+        # X-Forwarded-For can be a comma-separated list; first entry is client
         return forwarded.split(",")[0].strip()
     return flask_request.remote_addr or "unknown"
 
 
 def _get_ua() -> str:
-    return (flask_request.user_agent.string or "")[:256]
+    """Return a truncated User-Agent string for audit logging."""
+    return (flask_request.user_agent.string or "unknown")[:256]
 
 
-def current_app_log(msg: str) -> None:
-    """Safe logging that works inside and outside app context."""
-    try:
-        from flask import current_app
-        current_app.logger.warning(msg)
-    except RuntimeError:
-        print(msg)
+def _derive_username(payload: dict, email: str) -> str:
+    """
+    Derive a safe username from the Auth0 token payload.
+    Falls back to the email prefix if no nickname is available.
+    Strips non-alphanumeric characters to prevent injection in display names.
+
+    STRIDE Tampering: username is derived server-side from verified
+    Auth0 claims — never taken raw from a request body.
+    """
+    import re
+    raw = payload.get("nickname") or payload.get("name") or email.split("@")[0]
+    # Keep only letters, numbers, underscores; truncate to 50 chars
+    safe = re.sub(r"[^\w]", "_", raw)[:50]
+    return safe or "user"

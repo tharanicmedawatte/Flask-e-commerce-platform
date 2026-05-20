@@ -1,209 +1,319 @@
+# =============================================================================
 # app/auth/routes.py
-# HTTP routes for the auth blueprint.
-# Kept thin — validation and business logic live in services.py.
-# Each route does: parse → call service → return response → nothing else.
+# HTTP endpoints for the auth blueprint.
+#
+# What this file does:
+#   Exposes the API endpoints that Next.js calls after Auth0 authentication.
+#   Every route is intentionally thin — it only:
+#     1. Extracts data from the request
+#     2. Calls a service function
+#     3. Returns a JSON response
+#   All logic lives in services.py, not here.
 #
 # Endpoints:
-#   POST /auth/register          — new user registration
-#   GET  /auth/verify/<token>    — email verification link
-#   POST /auth/login             — login (returns JWT)
-#   POST /auth/logout            — logout (clears session + audit)
-#   GET  /auth/me                — current user profile (JWT-protected)
-#   POST /auth/guest-session     — initialise a guest session token
+#   POST /auth/sync      — called by Next.js after every Auth0 login
+#                          creates/updates the MySQL user row
+#   GET  /auth/me        — returns the current user's profile
+#   POST /auth/logout    — records logout event in AuditLog
+#   GET  /auth/status    — health check, tells Next.js if token is valid
+#
+# Auth flow reminder:
+#   Next.js → Auth0 Universal Login → Auth0 returns JWT → Next.js stores token
+#   → Next.js calls /auth/sync with token → Flask verifies + syncs MySQL row
+#   → All subsequent requests carry Authorization: Bearer <token>
+#
+# What this file does NOT do:
+#   - No login form or register form — Auth0 handles those
+#   - No password handling — Auth0 handles that
+#   - No MFA setup — Auth0 handles that (configured in Auth0 dashboard)
+#   - No email verification emails — Auth0 handles those too
+# =============================================================================
 
-from flask import Blueprint, jsonify, request, session
-from flask_login import login_user, logout_user, current_user
+import logging
+from datetime import datetime, timezone
 
-from app.extensions import limiter
-from .decorators import login_required, guest_or_user
-from .services import AuthService, create_guest_session
+from flask import Blueprint, g, jsonify, request
+from flask_login import logout_user
+
+from app.extensions import db, limiter
+from app.models import AuditLog, User
+from .services import Auth0TokenService, UserSyncService
+
+logger = logging.getLogger(__name__)
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
 
 
-# ---------------------------------------------------------------------------
-# Registration
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Helper — used by every route in this file
+# =============================================================================
 
-@auth_bp.route("/register", methods=["POST"])
-@limiter.limit("5 per minute; 20 per hour")     # prevents account-creation floods
-def register():
+def _extract_token() -> str | None:
     """
-    Register a new user account.
+    Extract the Bearer token from the Authorization header.
 
-    Expects JSON:
-        { "email": "...", "username": "...",
-          "password": "...", "confirm_password": "..." }
+    Expected header format:
+        Authorization: Bearer eyJhbGciOiJSUzI1NiIs...
 
-    On success: 201 with user dict (no password, no token — user must verify first).
-    On failure: 400 with list of validation errors.
+    Returns the token string or None if the header is missing or malformed.
 
-    STRIDE — Spoofing: generic error on duplicate (no email enumeration).
-    STRIDE — DoS:      rate-limited to 5 attempts/minute per IP.
+    STRIDE Spoofing: token is extracted here but NOT trusted until
+    Auth0TokenService.verify() confirms the signature in each route.
     """
-    data = request.get_json(silent=True)
-    if not data:
-        return jsonify({"error": "Request body must be JSON."}), 400
-
-    user, errors = AuthService.register(data)
-
-    if errors:
-        return jsonify({"errors": errors}), 400
-
-    return jsonify({
-        "message": "Account created. Please check your email to verify your address.",
-        "user": user.to_dict(),
-    }), 201
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer ") and len(auth_header) > 7:
+        return auth_header.split(" ", 1)[1].strip()
+    return None
 
 
-# ---------------------------------------------------------------------------
-# Email verification
-# ---------------------------------------------------------------------------
+def _get_ip() -> str:
+    """Real client IP, respecting X-Forwarded-For behind Nginx."""
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.remote_addr or "unknown"
 
-@auth_bp.route("/verify/<string:token>", methods=["GET"])
-@limiter.limit("10 per minute")
-def verify_email(token: str):
+
+def _get_ua() -> str:
+    """Truncated User-Agent for audit logging."""
+    return (request.user_agent.string or "unknown")[:256]
+
+
+# =============================================================================
+# POST /auth/sync
+# =============================================================================
+
+@auth_bp.route("/sync", methods=["POST"])
+@limiter.limit("30 per minute")
+def sync_user():
     """
-    One-click email verification.
-    The link is emailed to the user after registration.
+    Sync an Auth0 user into MySQL after login.
 
-    On success: 200 — account is now active.
-    On failure: 400 — token invalid or expired.
+    Called by Next.js immediately after Auth0 returns a token.
+    This is the entry point for all new users into the MySQL database.
+    Returning users are updated (last_login_at, is_verified).
 
-    STRIDE — Info Disclosure: token is opaque (random hex); no PII in URL.
+    Request:
+        POST /auth/sync
+        Authorization: Bearer <auth0_access_token>
+        Content-Type: application/json  (body can be empty)
+
+    Response 200:
+        {
+            "message": "User synced successfully.",
+            "user": { id, email, username, role, is_verified, ... }
+        }
+
+    Response 401:
+        { "error": "..." }
+
+    STRIDE Spoofing:
+        Token is verified cryptographically before any DB operation.
+        A missing, expired, or tampered token returns 401 immediately.
+
+    STRIDE Repudiation:
+        REGISTRATION_AUTH0 or LOGIN_AUTH0 written to AuditLog in service.
+
+    STRIDE DoS:
+        Rate limited to 30 requests per minute per IP.
+        In practice, Next.js calls this once per login — limit is generous
+        but still protects against automated abuse.
     """
-    if len(token) != 64:                    # quick sanity check before hitting DB
-        return jsonify({"error": "Invalid verification link."}), 400
+    token = _extract_token()
+    if not token:
+        # STRIDE Info Disclosure: generic message — no detail about what's wrong
+        return jsonify({"error": "Authorization token required."}), 401
 
-    user, error = AuthService.verify_email(token)
+    # Verify token signature, expiry, audience, issuer with Auth0
+    auth0_payload = Auth0TokenService.verify(token)
+    if not auth0_payload:
+        return jsonify({"error": "Invalid or expired token."}), 401
 
+    # Sync to MySQL — creates new row or updates existing
+    user, error = UserSyncService.sync(auth0_payload)
     if error:
-        return jsonify({"error": error}), 400
+        return jsonify({"error": error}), 500
 
     return jsonify({
-        "message": "Email verified successfully. You can now log in.",
+        "message": "User synced successfully.",
         "user": user.to_dict(),
     }), 200
 
 
-# ---------------------------------------------------------------------------
-# Login
-# ---------------------------------------------------------------------------
-
-@auth_bp.route("/login", methods=["POST"])
-@limiter.limit("10 per minute; 50 per hour")    # brute-force guard
-def login():
-    """
-    Authenticate with email + password.
-
-    Expects JSON: { "email": "...", "password": "..." }
-
-    On success: 200 with JWT access token.
-    On failure: 401 with generic error (same message for wrong email OR password).
-
-    STRIDE — Spoofing:     bcrypt comparison + generic error message.
-    STRIDE — DoS:          rate-limited + account lockout after 5 failures.
-    STRIDE — Repudiation:  login event written to AuditLog in service layer.
-    """
-    data = request.get_json(silent=True)
-    if not data:
-        return jsonify({"error": "Request body must be JSON."}), 400
-
-    email = data.get("email", "")
-    password = data.get("password", "")
-
-    if not email or not password:
-        return jsonify({"error": "Email and password are required."}), 400
-
-    user, token, error = AuthService.authenticate(email, password)
-
-    if error:
-        return jsonify({"error": error}), 401
-
-    # For browser clients: also set Flask-Login session
-    login_user(user, remember=data.get("remember_me", False))
-
-    return jsonify({
-        "message": "Login successful.",
-        "token": token,                # JWT for API / mobile clients
-        "user": user.to_dict(),
-    }), 200
-
-
-# ---------------------------------------------------------------------------
-# Logout
-# ---------------------------------------------------------------------------
-
-@auth_bp.route("/logout", methods=["POST"])
-@login_required
-def logout():
-    """
-    Log out the current user.
-    Clears Flask-Login session and records the event.
-
-    STRIDE — Repudiation: logout event written to AuditLog.
-    """
-    from flask import g
-    user = getattr(g, "current_user", current_user)
-    AuthService.logout(user.id)
-    logout_user()
-    session.clear()
-
-    return jsonify({"message": "Logged out successfully."}), 200
-
-
-# ---------------------------------------------------------------------------
-# Current user profile
-# ---------------------------------------------------------------------------
+# =============================================================================
+# GET /auth/me
+# =============================================================================
 
 @auth_bp.route("/me", methods=["GET"])
-@login_required
+@limiter.limit("60 per minute")
 def me():
     """
-    Return the authenticated user's profile.
-    Never returns password_hash or sensitive tokens.
+    Return the authenticated user's profile from MySQL.
 
-    STRIDE — Info Disclosure: to_dict() is the whitelist; nothing else is sent.
+    Called by Next.js to get the full user profile (role, verified status, etc.)
+    after Auth0 login. Auth0's own /userinfo endpoint returns Auth0 data;
+    this endpoint returns our application data (role, created_at, order history).
+
+    Request:
+        GET /auth/me
+        Authorization: Bearer <auth0_access_token>
+
+    Response 200:
+        {
+            "user": { id, email, username, role, is_verified, created_at, ... }
+        }
+
+    Response 401:
+        { "error": "..." }
+
+    Response 404:
+        { "error": "User not found. Please sync first." }
+        This happens if Next.js calls /me before calling /sync.
+        Next.js should always call /sync first, then /me.
+
+    STRIDE Info Disclosure:
+        to_dict() returns a whitelist of safe fields only.
+        auth0_id, internal flags, and audit logs are never returned.
     """
-    from flask import g
-    user = getattr(g, "current_user", current_user)
+    token = _extract_token()
+    if not token:
+        return jsonify({"error": "Authorization token required."}), 401
+
+    auth0_payload = Auth0TokenService.verify(token)
+    if not auth0_payload:
+        return jsonify({"error": "Invalid or expired token."}), 401
+
+    auth0_id = auth0_payload.get("sub")
+    user = User.query.filter_by(auth0_id=auth0_id).first()
+
+    if not user:
+        # User exists in Auth0 but not yet synced to MySQL
+        # Instruct Next.js to call /auth/sync first
+        return jsonify({
+            "error": "User profile not found. Please call /auth/sync first."
+        }), 404
+
+    if not user.is_active:
+        # STRIDE Elevation: deactivated users cannot access any resource
+        AuditLog.record(
+            event="ACCESS_DENIED_INACTIVE",
+            user_id=user.id,
+            ip_address=_get_ip(),
+            user_agent=_get_ua(),
+        )
+        db.session.commit()
+        return jsonify({"error": "Account deactivated. Please contact support."}), 403
+
     return jsonify({"user": user.to_dict()}), 200
 
 
-# ---------------------------------------------------------------------------
-# Guest session
-# ---------------------------------------------------------------------------
+# =============================================================================
+# POST /auth/logout
+# =============================================================================
 
-@auth_bp.route("/guest-session", methods=["POST"])
-@limiter.limit("20 per minute")
-def guest_session():
+@auth_bp.route("/logout", methods=["POST"])
+@limiter.limit("30 per minute")
+def logout():
     """
-    Initialise a guest session for unregistered visitors.
-    Returns a signed session identifier so the guest's cart and browsing
-    context can be persisted across requests without a DB row.
+    Record a logout event in AuditLog.
 
-    Guests can browse products and add items to cart.
-    They are prompted to register at checkout.
+    Auth0 and Next.js handle the actual session/token invalidation on
+    the frontend. This endpoint exists purely for the server-side audit trail.
 
-    STRIDE — Elevation: role='guest' is set server-side; cannot be escalated
-                        without completing registration.
+    Next.js logout flow:
+        1. Call POST /auth/logout (this endpoint) — records audit event
+        2. Call Auth0's /v2/logout — clears Auth0 session
+        3. Clear the token from Next.js state/localStorage
+
+    Request:
+        POST /auth/logout
+        Authorization: Bearer <auth0_access_token>
+
+    Response 200:
+        { "message": "Logged out successfully." }
+
+    STRIDE Repudiation:
+        LOGOUT event written to AuditLog so there is a server-side record
+        that the user ended their session at a specific time from a specific IP.
     """
-    guest_data = create_guest_session()
+    token = _extract_token()
 
-    # Store guest context in the Flask signed cookie session
-    session["guest_id"] = guest_data["guest_id"]
-    session["role"] = "guest"
+    if token:
+        auth0_payload = Auth0TokenService.verify(token)
+        if auth0_payload:
+            auth0_id = auth0_payload.get("sub")
+            user = User.query.filter_by(auth0_id=auth0_id).first()
+            if user:
+                AuditLog.record(
+                    event="LOGOUT",
+                    user_id=user.id,
+                    ip_address=_get_ip(),
+                    user_agent=_get_ua(),
+                )
+                db.session.commit()
+                logger.info(f"[Auth] Logout recorded for user: {user.email}")
+
+    # Clear Flask-Login session if active (browser clients)
+    logout_user()
+
+    # Always return 200 — logout should never fail from the user's perspective
+    return jsonify({"message": "Logged out successfully."}), 200
+
+
+# =============================================================================
+# GET /auth/status
+# =============================================================================
+
+@auth_bp.route("/status", methods=["GET"])
+@limiter.limit("60 per minute")
+def status():
+    """
+    Token validity check — used by Next.js to gate protected pages.
+
+    Next.js calls this on page load to check if the stored token is still
+    valid before rendering protected content (e.g. account page, checkout).
+    Faster than calling /me — returns minimal data.
+
+    Request:
+        GET /auth/status
+        Authorization: Bearer <auth0_access_token>
+
+    Response 200 (valid token, active user):
+        {
+            "authenticated": true,
+            "role": "customer",
+            "is_verified": true
+        }
+
+    Response 200 (no token / invalid token):
+        {
+            "authenticated": false
+        }
+
+    Note: Always returns HTTP 200 — Next.js checks the "authenticated" field.
+    This avoids error handling complexity on the frontend for this common check.
+
+    STRIDE Info Disclosure:
+        Returns only role and is_verified — the minimum Next.js needs to
+        decide which page to render. Full profile requires /auth/me.
+    """
+    token = _extract_token()
+
+    if not token:
+        return jsonify({"authenticated": False}), 200
+
+    auth0_payload = Auth0TokenService.verify(token)
+    if not auth0_payload:
+        return jsonify({"authenticated": False}), 200
+
+    auth0_id = auth0_payload.get("sub")
+    user = User.query.filter_by(auth0_id=auth0_id).first()
+
+    if not user or not user.is_active:
+        return jsonify({"authenticated": False}), 200
 
     return jsonify({
-        "guest_id": guest_data["guest_id"],
-        "role": "guest",
-        "message": "Guest session started. Register to save your cart and order history.",
+        "authenticated": True,
+        "role":          user.role,
+        "is_verified":   user.is_verified,
     }), 200
-
-
-# ---------------------------------------------------------------------------
-# Blueprint __init__.py helper (also register here so imports are clean)
-# ---------------------------------------------------------------------------
-# app/auth/__init__.py should contain only:
-#   from .routes import auth_bp
-#   __all__ = ["auth_bp"]
