@@ -1,1 +1,0 @@
-# Flask-e-commerce-platform
