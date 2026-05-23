@@ -1,0 +1,51 @@
+
+# =============================================================================
+# requirements.txt
+# Flask e-commerce platform — Developer 2 (Products Blueprint)
+# Install: pip install -r requirements.txt
+# =============================================================================
+
+# --- Core Flask ---------------------------------------------------------------
+Flask==3.0.3
+Werkzeug==3.0.3
+
+# --- Database (MySQL + ORM) ---------------------------------------------------
+Flask-SQLAlchemy==3.1.1
+SQLAlchemy==2.0.31
+PyMySQL==1.1.1          # pure-Python MySQL driver (no C deps needed)
+cryptography==42.0.8    # required by PyMySQL for auth plugins
+
+# --- Migrations ---------------------------------------------------------------
+Flask-Migrate==4.0.7    # Alembic wrapper for Flask
+
+# --- Auth0 (JWT validation) ---------------------------------------------------
+Authlib==1.3.1          # OAuth2 / OIDC client used by Dev 1's auth decorators
+PyJWT==2.8.0            # JWT decode / verify
+python-jose==3.3.0      # alternative JWT lib (Auth0 docs use this)
+requests==2.32.3        # HTTP calls to Auth0 JWKS endpoint
+
+# --- Stripe -------------------------------------------------------------------
+stripe==10.5.0
+
+# --- Rate limiting (used in routes.py) ----------------------------------------
+Flask-Limiter==3.7.0
+limits==3.13.0
+
+# --- Forms & validation -------------------------------------------------------
+Flask-WTF==1.2.1
+WTForms==3.1.2
+email-validator==2.2.0
+
+# --- Environment / config -----------------------------------------------------
+python-dotenv==1.0.1    # loads .env into os.environ
+
+# --- CORS (Next.js frontend calls Flask API) ----------------------------------
+Flask-CORS==4.0.1
+
+# --- Serialisation ------------------------------------------------------------
+marshmallow==3.21.3     # optional — useful if you later add schema validation
+
+# --- Dev / testing ------------------------------------------------------------
+pytest==8.2.2
+pytest-flask==1.3.0
+coverage==7.5.4
