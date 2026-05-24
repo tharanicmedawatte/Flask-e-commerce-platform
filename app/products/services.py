@@ -324,7 +324,7 @@ class CartService:
 
         item.quantity = quantity
         db.session.commit()
-        return item.cart.to_dict(), ""
+        return CartService.get_cart(user_id), ""
 
     @staticmethod
     def remove_item(user_id: str, item_id: int) -> tuple[dict, str]:

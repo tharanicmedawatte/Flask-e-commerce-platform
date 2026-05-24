@@ -143,8 +143,8 @@ def get_product(product_id: str):
       to_dict() in the service layer ensures cost_price / supplier are never
       included in the response, even for a direct ID lookup.
 
-    Flask casts <int:product_id> from the URL — non-integer IDs return 404
-    automatically, preventing string-injection attempts via the URL segment.
+    product_id is a UUID string — the <product_id> string converter is correct.
+    SQLAlchemy's ORM parameterises the value, preventing SQL injection.
     """
     product = ProductService.get_by_id(product_id)
     if not product:
