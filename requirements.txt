@@ -1,7 +1,6 @@
-
 # =============================================================================
 # requirements.txt
-# Flask e-commerce platform — Developer 2 (Products Blueprint)
+# Flask e-commerce platform — all developers
 # Install: pip install -r requirements.txt
 # =============================================================================
 
@@ -19,22 +18,27 @@ cryptography==42.0.8    # required by PyMySQL for auth plugins
 Flask-Migrate==4.0.7    # Alembic wrapper for Flask
 
 # --- Auth0 (JWT validation) ---------------------------------------------------
-Authlib==1.3.1          # OAuth2 / OIDC client used by Dev 1's auth decorators
-PyJWT==2.8.0            # JWT decode / verify
-python-jose==3.3.0      # alternative JWT lib (Auth0 docs use this)
+python-jose==3.3.0      # JWT decode / verify (used by Auth0TokenService)
 requests==2.32.3        # HTTP calls to Auth0 JWKS endpoint
 
 # --- Stripe -------------------------------------------------------------------
 stripe==10.5.0
 
-# --- Rate limiting (used in routes.py) ----------------------------------------
+# --- Email --------------------------------------------------------------------
+Flask-Mail==0.10.0      # SMTP email (used by Dev 3 for order confirmations)
+sendgrid==6.11.0        # SendGrid SDK (alternative to SMTP)
+
+# --- Rate limiting ------------------------------------------------------------
 Flask-Limiter==3.7.0
 limits==3.13.0
 
-# --- Forms & validation -------------------------------------------------------
+# --- Forms & CSRF protection --------------------------------------------------
 Flask-WTF==1.2.1
 WTForms==3.1.2
 email-validator==2.2.0
+
+# --- Security headers ---------------------------------------------------------
+Flask-Talisman==1.1.0   # CSP, HSTS, and other security headers
 
 # --- Environment / config -----------------------------------------------------
 python-dotenv==1.0.1    # loads .env into os.environ
