@@ -8,6 +8,15 @@
 #   Tampering          — prices always recalculated from DB, never from client
 #   Repudiation        — every payment event written to AuditLog
 #   Information Disclosure — Stripe transaction IDs logged, card details never stored
+#
+# Fixes applied (to match models.py):
+#   - Removed OrderStatus import — Order.status uses plain strings
+#   - "pending" / "paid" / "failed" string literals replace OrderStatus.* enum
+#   - shipping_address_line1/line2 → shipping_address (single field in model)
+#   - stripe_transaction_id → stripe_charge_id (field name in model)
+#   - product.is_visible → product.is_active (field name in model)
+#   - AuditLog.record(details=...) → AuditLog.record(detail=...) (param name in model)
+#   - <int:order_id> route type fixed to string UUID in OrderService queries
 
 import stripe
 from decimal import Decimal
@@ -15,7 +24,7 @@ from datetime import datetime, timezone
 
 from flask import current_app
 from app.extensions import db
-from app.models import Cart, CartItem, Order, OrderItem, OrderStatus, Product, AuditLog
+from app.models import Cart, CartItem, Order, OrderItem, Product, AuditLog
 
 
 class CheckoutService:
@@ -23,7 +32,7 @@ class CheckoutService:
     Handles the two-step Stripe payment flow:
 
     Step 1 — initiate():
-        Validate cart → calculate total from DB → create Order (status=PENDING)
+        Validate cart → calculate total from DB → create Order (status="pending")
         → create Stripe PaymentIntent → return client_secret to Next.js
 
     Step 2 — confirm_payment() / mark_failed():
@@ -36,7 +45,7 @@ class CheckoutService:
     """
 
     @staticmethod
-    def initiate(user_id: int, shipping: dict) -> tuple:
+    def initiate(user_id: str, shipping: dict) -> tuple:
         """
         Validate cart, build the order, create a Stripe PaymentIntent.
 
@@ -58,10 +67,10 @@ class CheckoutService:
         validated_items = []
 
         for cart_item in cart.items:
-            product = Product.query.get(cart_item.product_id)
+            product = db.session.get(Product, cart_item.product_id)
             if not product:
-                return None, None, f"A product in your cart is no longer available."
-            if not product.is_visible:
+                return None, None, "A product in your cart is no longer available."
+            if not product.is_active:                          # fix: is_visible → is_active
                 return None, None, f"'{product.name}' is no longer available."
             if product.stock < cart_item.quantity:
                 return None, None, (
@@ -71,25 +80,29 @@ class CheckoutService:
             line_total = product.price * cart_item.quantity
             total += line_total
             validated_items.append({
-                "product":          product,
-                "quantity":         cart_item.quantity,
-                "price_at_purchase": product.price,  # snapshot at this moment
-                "product_name":     product.name,    # snapshot in case name changes
+                "product":           product,
+                "quantity":          cart_item.quantity,
+                "price_at_purchase": product.price,   # snapshot at this moment
+                "product_name":      product.name,    # snapshot in case name changes later
             })
 
         if total <= 0:
             return None, None, "Order total must be greater than zero."
 
-        # 3. Create the Order row (status=PENDING — no money moved yet)
+        # 3. Create the Order row (status="pending" — no money moved yet)
+        #    shipping_address is a single field in models.py — combine lines here
+        shipping_address = shipping.get("address_line1", "")
+        if shipping.get("address_line2"):
+            shipping_address += f", {shipping['address_line2']}"
+
         order = Order(
             user_id=user_id,
-            status=OrderStatus.PENDING,
+            status="pending",                          # fix: OrderStatus.PENDING → "pending"
             total=total,
             shipping_name=shipping.get("name"),
-            shipping_address_line1=shipping.get("address_line1"),
-            shipping_address_line2=shipping.get("address_line2"),
+            shipping_address=shipping_address,         # fix: single field, not line1/line2
             shipping_city=shipping.get("city"),
-            shipping_postal_code=shipping.get("postal_code"),
+            shipping_postcode=shipping.get("postal_code"),
             shipping_country=shipping.get("country"),
         )
         db.session.add(order)
@@ -111,7 +124,7 @@ class CheckoutService:
         #    STRIDE — Tampering: amount comes from our DB total, not the request body
         try:
             intent = stripe.PaymentIntent.create(
-                amount=int(total * 100),  # e.g. $19.99 → 1999
+                amount=int(total * 100),   # e.g. $19.99 → 1999
                 currency="usd",
                 automatic_payment_methods={"enabled": True},
                 metadata={
@@ -132,8 +145,9 @@ class CheckoutService:
         AuditLog.record(
             event="CHECKOUT_INITIATED",
             user_id=user_id,
-            details=f"Order #{order.id} | total=${total} | intent={intent.id}",
+            detail=f"Order {order.id} | total={total} | intent={intent.id}",  # fix: details → detail
         )
+        db.session.commit()
 
         return order, intent.client_secret, None
 
@@ -141,10 +155,10 @@ class CheckoutService:
     def confirm_payment(payment_intent_id: str, stripe_charge_id: str) -> bool:
         """
         Called by the Stripe webhook after payment_intent.succeeded event.
-        Marks the order as PAID, decrements stock, clears the cart.
+        Marks the order as "paid", decrements stock, clears the cart.
 
         STRIDE — Repudiation: payment confirmation written to AuditLog.
-        STRIDE — Information Disclosure: only last 4 digits and charge ID logged,
+        STRIDE — Information Disclosure: only charge ID logged,
         never full card details (which Stripe never sends us anyway).
 
         Returns True on success, False if order not found or already processed.
@@ -159,16 +173,16 @@ class CheckoutService:
             )
             return False
 
-        if order.status != OrderStatus.PENDING:
+        if order.status != "pending":
             # Already processed — idempotent handling (Stripe may retry webhooks)
             current_app.logger.warning(
-                f"Webhook: Order #{order.id} already has status {order.status.value}. Skipping."
+                f"Webhook: Order {order.id} already has status '{order.status}'. Skipping."
             )
             return True
 
         # Update order
-        order.status = OrderStatus.PAID
-        order.stripe_transaction_id = stripe_charge_id
+        order.status = "paid"                          # fix: OrderStatus.PAID → "paid"
+        order.stripe_charge_id = stripe_charge_id      # fix: stripe_transaction_id → stripe_charge_id
         order.paid_at = datetime.now(timezone.utc)
 
         # Decrement stock for each item
@@ -188,8 +202,9 @@ class CheckoutService:
         AuditLog.record(
             event="PAYMENT_CONFIRMED",
             user_id=order.user_id,
-            details=f"Order #{order.id} | charge={stripe_charge_id}",
+            detail=f"Order {order.id} | charge={stripe_charge_id}",  # fix: details → detail
         )
+        db.session.commit()
 
         return True
 
@@ -197,7 +212,7 @@ class CheckoutService:
     def mark_failed(payment_intent_id: str) -> bool:
         """
         Called by the Stripe webhook after payment_intent.payment_failed event.
-        Marks the order as FAILED. Cart is NOT cleared — user can retry.
+        Marks the order as "failed". Cart is NOT cleared — user can retry.
 
         STRIDE — Repudiation: failure written to AuditLog.
         """
@@ -208,17 +223,18 @@ class CheckoutService:
         if not order:
             return False
 
-        if order.status != OrderStatus.PENDING:
-            return True  # idempotent
+        if order.status != "pending":
+            return True   # idempotent — already processed
 
-        order.status = OrderStatus.FAILED
+        order.status = "failed"                        # fix: OrderStatus.FAILED → "failed"
         db.session.commit()
 
         AuditLog.record(
             event="PAYMENT_FAILED",
             user_id=order.user_id,
-            details=f"Order #{order.id} | intent={payment_intent_id}",
+            detail=f"Order {order.id} | intent={payment_intent_id}",  # fix: details → detail
         )
+        db.session.commit()
 
         return True
 
@@ -229,7 +245,7 @@ class OrderService:
     """
 
     @staticmethod
-    def get_order_history(user_id: int, page: int = 1, per_page: int = 10) -> dict:
+    def get_order_history(user_id: str, page: int = 1, per_page: int = 10) -> dict:
         """
         Return paginated order history for a user.
         Newest orders first.
@@ -241,25 +257,25 @@ class OrderService:
             .paginate(page=page, per_page=per_page, error_out=False)
         )
         return {
-            "orders":      [o.to_dict() for o in pagination.items],
-            "total":       pagination.total,
-            "page":        pagination.page,
-            "pages":       pagination.pages,
-            "per_page":    pagination.per_page,
-            "has_next":    pagination.has_next,
-            "has_prev":    pagination.has_prev,
+            "orders":   [o.to_dict() for o in pagination.items],
+            "total":    pagination.total,
+            "page":     pagination.page,
+            "pages":    pagination.pages,
+            "per_page": pagination.per_page,
+            "has_next": pagination.has_next,
+            "has_prev": pagination.has_prev,
         }
 
     @staticmethod
-    def get_order(order_id: int, user_id: int):
+    def get_order(order_id: str, user_id: str):
         """
         Get a single order, scoped to the requesting user.
-        Returns None if order doesn't exist or belongs to a different user.
+        Returns None if the order doesn't exist or belongs to a different user.
         STRIDE — Information Disclosure: users can only see their own orders.
         """
         return Order.query.filter_by(id=order_id, user_id=user_id).first()
 
     @staticmethod
-    def get_order_for_admin(order_id: int):
-        """Admin-only: get any order regardless of user."""
-        return Order.query.get(order_id)
+    def get_order_for_admin(order_id: str):
+        """Admin-only: get any order regardless of which user placed it."""
+        return db.session.get(Order, order_id)
