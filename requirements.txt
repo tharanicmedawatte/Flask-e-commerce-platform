@@ -1,0 +1,55 @@
+# =============================================================================
+# requirements.txt
+# Flask e-commerce platform — all developers
+# Install: pip install -r requirements.txt
+# =============================================================================
+
+# --- Core Flask ---------------------------------------------------------------
+Flask==3.0.3
+Werkzeug==3.0.3
+
+# --- Database (MySQL + ORM) ---------------------------------------------------
+Flask-SQLAlchemy==3.1.1
+SQLAlchemy==2.0.31
+PyMySQL==1.1.1          # pure-Python MySQL driver (no C deps needed)
+cryptography==42.0.8    # required by PyMySQL for auth plugins
+
+# --- Migrations ---------------------------------------------------------------
+Flask-Migrate==4.0.7    # Alembic wrapper for Flask
+
+# --- Auth0 (JWT validation) ---------------------------------------------------
+python-jose==3.3.0      # JWT decode / verify (used by Auth0TokenService)
+requests==2.32.3        # HTTP calls to Auth0 JWKS endpoint
+
+# --- Stripe -------------------------------------------------------------------
+stripe==10.5.0
+
+# --- Email --------------------------------------------------------------------
+Flask-Mail==0.10.0      # SMTP email (used by Dev 3 for order confirmations)
+sendgrid==6.11.0        # SendGrid SDK (alternative to SMTP)
+
+# --- Rate limiting ------------------------------------------------------------
+Flask-Limiter==3.7.0
+limits==3.13.0
+
+# --- Forms & CSRF protection --------------------------------------------------
+Flask-WTF==1.2.1
+WTForms==3.1.2
+email-validator==2.2.0
+
+# --- Security headers ---------------------------------------------------------
+Flask-Talisman==1.1.0   # CSP, HSTS, and other security headers
+
+# --- Environment / config -----------------------------------------------------
+python-dotenv==1.0.1    # loads .env into os.environ
+
+# --- CORS (Next.js frontend calls Flask API) ----------------------------------
+Flask-CORS==4.0.1
+
+# --- Serialisation ------------------------------------------------------------
+marshmallow==3.21.3     # optional — useful if you later add schema validation
+
+# --- Dev / testing ------------------------------------------------------------
+pytest==8.2.2
+pytest-flask==1.3.0
+coverage==7.5.4
