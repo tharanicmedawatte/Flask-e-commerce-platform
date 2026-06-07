@@ -217,9 +217,9 @@ def order_history():
     return jsonify(result), 200
 
 
-@orders_bp.route("/<int:order_id>", methods=["GET"])
+@orders_bp.route("/<order_id>", methods=["GET"])
 @login_required
-def order_detail(order_id: int):
+def order_detail(order_id: str):
     """
     Return a single order with all its line items.
 
@@ -232,10 +232,10 @@ def order_detail(order_id: int):
     return jsonify({"order": order.to_dict()}), 200
 
 
-@orders_bp.route("/<int:order_id>/admin", methods=["GET"])
+@orders_bp.route("/<order_id>/admin", methods=["GET"])
 @login_required
 @require_role("admin")   # STRIDE — Elevation of Privilege: admins only
-def order_detail_admin(order_id: int):
+def order_detail_admin(order_id: str):
     """
     Admin-only: view any order regardless of which user placed it.
     Used for customer support and fulfilment dashboards.
