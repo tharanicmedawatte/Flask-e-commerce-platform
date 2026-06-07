@@ -56,7 +56,7 @@ def create_app(config_name: str | None = None) -> Flask:
     register_products(app)
 
     # Orders / Payments (Dev 3) — uncomment when Dev 3 is ready
-    # from app.orders import register_orders
-    # register_orders(app)
+    from app.orders import orders_bp
+    app.register_blueprint(orders_bp)
 
     return app
