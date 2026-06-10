@@ -59,6 +59,18 @@ def _parse_int_param(name: str, default: int, min_val: int = 1, max_val: int = 9
 # error. Useful so Next.js can show personalised UI while still serving
 # anonymous visitors.
 # =============================================================================
+@products_bp.route("/products/categories", methods=["GET"])
+@guest_or_user
+def get_categories():
+    """Return all active categories."""
+    from app.models import Category
+    categories = Category.query.filter_by(is_active=True).order_by(Category.name).all()
+    return jsonify({
+        "categories": [
+            {"id": c.id, "name": c.name, "slug": c.slug}
+            for c in categories
+        ]
+    }), 200
 
 @products_bp.route("/products", methods=["GET"])
 @guest_or_user
