@@ -32,7 +32,9 @@ def create_app(config_name: str | None = None) -> Flask:
 
     # CORS — only the whitelisted frontend origin may call the API.
     # Wildcard "*" is never used (STRIDE Info Disclosure).
-    CORS(app, resources={r"/api/*": {"origins": app.config.get("FRONTEND_URL", "http://localhost:3000")}})
+    frontend_url = app.config.get("FRONTEND_URL", "http://localhost:3000")
+    origins = [o.strip() for o in frontend_url.split(",")]
+    CORS(app, resources={r"/api/*": {"origins": origins}})
 
     # Security headers — force HTTPS + CSP in production; relaxed in dev.
     Talisman(
