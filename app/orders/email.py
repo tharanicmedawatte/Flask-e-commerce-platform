@@ -24,7 +24,7 @@ def _build_items_table_html(items: list) -> str:
             <td style="padding:8px 12px; border-bottom:1px solid #e5e7eb;">{item['product_name']}</td>
             <td style="padding:8px 12px; border-bottom:1px solid #e5e7eb; text-align:center;">{item['quantity']}</td>
             <td style="padding:8px 12px; border-bottom:1px solid #e5e7eb; text-align:right;">${item['price_at_purchase']}</td>
-            <td style="padding:8px 12px; border-bottom:1px solid #e5e7eb; text-align:right;">${item['line_total']}</td>
+            <td style="padding:8px 12px; border-bottom:1px solid #e5e7eb; text-align:right;">${item['subtotal']}</td>
         </tr>"""
     return rows
 
@@ -35,7 +35,7 @@ def _build_items_plain(items: list) -> str:
     for item in items:
         lines.append(
             f"  {item['product_name']} x{item['quantity']} "
-            f"@ ${item['price_at_purchase']} = ${item['line_total']}"
+            f"@ ${item['price_at_purchase']} = ${item['subtotal']}"
         )
     return "\n".join(lines)
 
@@ -58,12 +58,10 @@ def send_order_confirmation_email(order) -> None:
     items_plain = _build_items_plain([item.to_dict() for item in order.items])
 
     shipping = order.shipping_name or ""
-    if order.shipping_address_line1:
-        shipping += f"\n{order.shipping_address_line1}"
-    if order.shipping_address_line2:
-        shipping += f"\n{order.shipping_address_line2}"
+    if order.shipping_address:
+        shipping += f"\n{order.shipping_address}"
     if order.shipping_city:
-        shipping += f"\n{order.shipping_city} {order.shipping_postal_code or ''}"
+        shipping += f"\n{order.shipping_city} {order.shipping_postcode or ''}"
 
     html_body = f"""
 <!DOCTYPE html>

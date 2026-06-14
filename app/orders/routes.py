@@ -33,6 +33,8 @@ from .services import CheckoutService, OrderService
 from .email import send_order_confirmation_email, send_order_failed_email
 from app.extensions import limiter
 
+from app.extensions import csrf
+
 logger = logging.getLogger(__name__)
 
 orders_bp = Blueprint("orders", __name__, url_prefix="/orders")
@@ -100,6 +102,7 @@ def create_payment_intent():
 # =============================================================================
 
 @orders_bp.route("/webhook/stripe", methods=["POST"])
+@csrf.exempt
 def stripe_webhook():
     """
     Stripe calls this URL automatically after a payment succeeds or fails.
