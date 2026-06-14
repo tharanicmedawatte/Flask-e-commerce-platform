@@ -233,7 +233,22 @@ class UserSyncService:
         auth0_id = auth0_payload.get("sub")
         email    = auth0_payload.get("email")
 
-        # sub and email are required — every Auth0 token has these
+        # Access tokens don't always include email — fetch from Auth0 userinfo if missing
+        if not email and auth0_id:
+            try:
+                domain = current_app.config.get("AUTH0_DOMAIN")
+                token  = flask_request.headers.get("Authorization", "").split(" ", 1)[-1]
+                resp   = requests.get(
+                    f"https://{domain}/userinfo",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=5,
+                )
+                if resp.ok:
+                    userinfo = resp.json()
+                    email = userinfo.get("email")
+            except Exception as exc:
+                logger.warning(f"[UserSync] Could not fetch userinfo: {exc}")
+
         if not auth0_id or not email:
             logger.warning("[UserSync] Token missing sub or email claim.")
             return None, "Invalid token claims."
@@ -245,7 +260,8 @@ class UserSyncService:
 
             if user:
                 # Existing user — update fields that may have changed in Auth0
-                user.is_verified  = auth0_payload.get("email_verified", False)
+                if auth0_payload.get("email_verified") or auth0_id.startswith("google-oauth2|"):
+                    user.is_verified = True
                 user.last_login_at = datetime.now(timezone.utc)
 
                 AuditLog.record(
@@ -266,7 +282,7 @@ class UserSyncService:
                     email       = email,
                     username    = username,
                     role        = "customer",   # STRIDE Elevation: always customer
-                    is_verified = auth0_payload.get("email_verified", False),
+                    is_verified = auth0_payload.get("email_verified", False) or auth0_id.startswith("google-oauth2|"),
                     is_active   = True,
                 )
                 db.session.add(user)

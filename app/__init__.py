@@ -34,7 +34,11 @@ def create_app(config_name: str | None = None) -> Flask:
     # Wildcard "*" is never used (STRIDE Info Disclosure).
     frontend_url = app.config.get("FRONTEND_URL", "http://localhost:3000")
     origins = [o.strip() for o in frontend_url.split(",")]
-    CORS(app, resources={r"/api/*": {"origins": origins}})
+    CORS(app, resources={
+    r"/api/*": {"origins": origins},
+    r"/orders/*": {"origins": origins},
+    r"/auth/*": {"origins": origins},
+})
 
     # Security headers — force HTTPS + CSP in production; relaxed in dev.
     Talisman(
