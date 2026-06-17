@@ -2,7 +2,7 @@ services:
   - type: web
     name: maple-and-moss-backend
     runtime: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt && flask db upgrade
     startCommand: gunicorn -w 4 -b 0.0.0.0:$PORT "app:create_app()"
     envVars:
       - key: FLASK_ENV
