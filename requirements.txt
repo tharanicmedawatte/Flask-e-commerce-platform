@@ -32,6 +32,7 @@ sendgrid==6.11.0        # SendGrid SDK (alternative to SMTP)
 # --- Rate limiting ------------------------------------------------------------
 Flask-Limiter==3.7.0
 limits==3.13.0
+redis==5.0.8
 
 # --- Forms & CSRF protection --------------------------------------------------
 Flask-WTF==1.2.1
