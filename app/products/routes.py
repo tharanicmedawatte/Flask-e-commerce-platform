@@ -24,6 +24,8 @@ from app.extensions import limiter                              # Flask-Limiter 
 from . import products_bp                                       # blueprint instance
 from .services import CartService, ProductService
 
+from app.extensions import csrf
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -191,6 +193,7 @@ def get_cart():
 
 
 @products_bp.route("/cart", methods=["POST"])
+@csrf.exempt
 @login_required
 def add_to_cart():
     """
@@ -232,6 +235,7 @@ def add_to_cart():
 
 
 @products_bp.route("/cart/<int:item_id>", methods=["PUT"])
+@csrf.exempt
 @login_required
 def update_cart_item(item_id: int):
     """
@@ -270,6 +274,7 @@ def update_cart_item(item_id: int):
 
 
 @products_bp.route("/cart/<int:item_id>", methods=["DELETE"])
+@csrf.exempt
 @login_required
 def remove_cart_item(item_id: int):
     """
