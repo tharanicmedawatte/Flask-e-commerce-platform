@@ -30,6 +30,15 @@ def create_app(config_name: str | None = None) -> Flask:
     mail.init_app(app)
     csrf.init_app(app)
 
+    # All Flask routes are REST API endpoints called from Next.js.
+    # CSRF protection is handled by Auth0 JWT tokens instead.
+    from app.products import products_bp as _products_bp
+    from app.orders import orders_bp as _orders_bp
+    from app.auth import auth_bp as _auth_bp
+    csrf.exempt(_products_bp)
+    csrf.exempt(_orders_bp)
+    csrf.exempt(_auth_bp)
+
     # CORS — only the whitelisted frontend origin may call the API.
     # Wildcard "*" is never used (STRIDE Info Disclosure).
     frontend_url = app.config.get("FRONTEND_URL", "http://localhost:3000")
