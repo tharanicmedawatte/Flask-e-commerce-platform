@@ -17,8 +17,6 @@ def create_app(config_name: str | None = None) -> Flask:
     cfg = config_name or os.getenv("FLASK_ENV", "development")
     app.config.from_object(config_map[cfg])
 
-    # Validate required env vars when running in production — fails loudly
-    # at startup rather than silently serving broken responses later.
     if cfg == "production":
         config_map["production"].validate()
 
@@ -30,17 +28,16 @@ def create_app(config_name: str | None = None) -> Flask:
     mail.init_app(app)
     csrf.init_app(app)
 
-    # CORS — only the whitelisted frontend origin may call the API.
-    # Wildcard "*" is never used (STRIDE Info Disclosure).
+    # CORS
     frontend_url = app.config.get("FRONTEND_URL", "http://localhost:3000")
     origins = [o.strip() for o in frontend_url.split(",")]
     CORS(app, resources={
-    r"/api/*": {"origins": origins},
-    r"/orders/*": {"origins": origins},
-    r"/auth/*": {"origins": origins},
-})
+        r"/api/*":    {"origins": origins},
+        r"/orders/*": {"origins": origins},
+        r"/auth/*":   {"origins": origins},
+    })
 
-    # Security headers — force HTTPS + CSP in production; relaxed in dev.
+    # Security headers
     Talisman(
         app,
         force_https=app.config.get("TALISMAN_FORCE_HTTPS", False),
@@ -48,21 +45,24 @@ def create_app(config_name: str | None = None) -> Flask:
         content_security_policy_nonce_in=["script-src"],
     )
 
-    # ── Import models so Alembic can detect all tables ────────────────────────
+    # ── Import models ─────────────────────────────────────────────────────────
     with app.app_context():
         from app import models  # noqa: F401
 
     # ── Blueprints ────────────────────────────────────────────────────────────
-    # Auth (Dev 1)
     from app.auth import auth_bp
-    app.register_blueprint(auth_bp)
-
-    # Products + Cart (Dev 2)
-    from app.products import register_products
-    register_products(app)
-
-    # Orders / Payments (Dev 3) — uncomment when Dev 3 is ready
+    from app.products import products_bp, register_products
     from app.orders import orders_bp
+
+    # Register blueprints first
+    app.register_blueprint(auth_bp)
+    register_products(app)
     app.register_blueprint(orders_bp)
+
+    # Exempt ALL blueprints from CSRF after registration
+    # All routes are REST API endpoints authenticated via Auth0 JWT tokens
+    csrf.exempt(auth_bp)
+    csrf.exempt(products_bp)
+    csrf.exempt(orders_bp)
 
     return app
