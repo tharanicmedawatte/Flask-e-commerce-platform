@@ -46,7 +46,6 @@ orders_bp = Blueprint("orders", __name__, url_prefix="/orders")
 
 @orders_bp.route("/create-payment-intent", methods=["POST"])
 @login_required
-@verified_required
 @limiter.limit("10 per minute")   # STRIDE — DoS: prevent PaymentIntent flood
 def create_payment_intent():
     """
